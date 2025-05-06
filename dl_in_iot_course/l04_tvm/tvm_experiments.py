@@ -1,7 +1,8 @@
 import argparse
 import numpy as np
 import tvm  # noqa: F401
-from tvm import relay, transform
+from tvm import relay, transform, runtime  # noqa: F401
+from tvm.contrib import graph_executor  # noqa: F401
 import tflite
 import tensorflow as tf
 
@@ -52,23 +53,38 @@ class TVMModel(ModelTester):
         self.opt_level = opt_level
         self.use_nchw_layout = use_nchw_layout
         self.quantized = False
+
+        self.in_scale = self.out_scale = None
+        self.in_zero_point = self.out_zero_point = None
+        self.tvm_module: Optional[graph_executor.GraphModule] = None
         super().__init__(dataset, modelpath, originalmodel, logdir)
 
     def preprocess_input(self, X):
-        # TODO implement
-        pass
+        if self.use_nchw_layout:
+            X = X.transpose((0, 3, 1, 2))
+        if self.quantized:
+            q = np.round(X / self.in_scale + self.in_zero_point).astype(
+                self.input_dtype
+            )
+        else:
+            q = X.astype("float32")
+        tvm_input = tvm.nd.array(q, device=self.device)
+        self.tvm_module.set_input(0, tvm_input)
 
     def postprocess_outputs(self, Y):
-        # TODO implement
-        pass
+        out = Y.asnumpy()
+        if self.quantized:
+            out = (out.astype("float32") - self.out_zero_point) * self.out_scale
+        return out[0]
 
     def prepare_model(self):
-        # TODO implement
-        pass
+        lib = tvm.runtime.load_module(str(self.modelpath))
+        self.device = tvm.runtime.device(self.target, 0)
+        self.tvm_module = graph_executor.GraphModule(lib["default"](self.device))
 
     def run_inference(self):
-        # TODO implement
-        pass
+        self.tvm_module.run()
+        return self.tvm_module.get_output(0)
 
     def optimize_model(self, originalmodel: Path):
         with open(originalmodel, "rb") as f:
@@ -92,10 +108,12 @@ class TVMModel(ModelTester):
         transforms = [relay.transform.RemoveUnusedFunctions()]
 
         if self.use_nchw_layout:
+            print("\n\nDUPA\n\n")
             transforms.append(
                 relay.transform.ConvertLayout(
                     {
                         "nn.conv2d": ["NCHW", "default"],
+                        "nn.depthwise_conv2d": ["NCHW", "default"],
                         # TODO add support for converting layout in quantized
                         # network
                     }
@@ -104,8 +122,17 @@ class TVMModel(ModelTester):
 
         seq = transform.Sequential(transforms)  # noqa: F841
 
-        # TODO implement
-        pass
+        shape_dict = {input_details["name"]: list(input_details["shape"])}
+        dtype_dict = {input_details["name"]: str(input_details["dtype"].__name__)}
+        mod, params = relay.frontend.from_tflite(
+            tflite_model, shape_dict=shape_dict, dtype_dict=dtype_dict
+        )
+        mod = seq(mod)
+        with transform.PassContext(opt_level=self.opt_level):
+            lib = relay.build(
+                mod, target=self.target, params=params, target_host=self.target_host
+            )
+        lib.export_library(str(self.modelpath))
 
 
 if __name__ == "__main__":
@@ -150,57 +177,50 @@ if __name__ == "__main__":
 
     dataset = PetDataset(args.dataset_root, args.download_dataset)
 
-    # # TVM MODEL WITH NHWC LAYOUT
-    # print('TVM MODEL WITH NHWC LAYOUT')
-    # tester = TVMModel(
-    #     dataset,
-    #     args.results_path / f'{args.fp32_model_path.stem}.tvm-fp32-nhwc.so',
-    #     args.fp32_model_path,
-    #     args.results_path / 'tvm-fp32-nhwc',
-    #     args.target,
-    #     args.target_host,
-    #     3,
-    #     use_nchw_layout=False
-    # )
-    # tester.test_inference(
-    #     args.results_path,
-    #     'tvm-fp32-nhwc',
-    #     args.test_dataset_fraction
-    # )
+    # TVM MODEL WITH NHWC LAYOUT
+    print("TVM MODEL WITH NHWC LAYOUT")
+    tester = TVMModel(
+        dataset,
+        args.results_path / f"{args.fp32_model_path.stem}.tvm-fp32-nhwc.so",
+        args.fp32_model_path,
+        args.results_path / "tvm-fp32-nhwc",
+        args.target,
+        args.target_host,
+        3,
+        use_nchw_layout=False,
+    )
+    tester.test_inference(
+        args.results_path, "tvm-fp32-nhwc", args.test_dataset_fraction
+    )
 
-    # # TVM MODEL WITH NCHW LAYOUT
-    # for opt_level in [1, 2, 3, 4]:
-    #     print(f'TVM MODEL WITH NCHW LAYOUT OPT LEVEL {opt_level}')
-    #     tester = TVMModel(
-    #         dataset,
-    #         args.results_path / f'{args.fp32_model_path.stem}.tvm-fp32-opt{opt_level}.so',  # noqa: E501
-    #         args.fp32_model_path,
-    #         args.results_path / f'tvm-fp32-opt{opt_level}',
-    #         args.target,
-    #         args.target_host,
-    #         opt_level,
-    #         use_nchw_layout=True
-    #     )
-    #     tester.test_inference(
-    #         args.results_path,
-    #         f'tvm-fp32-opt{opt_level}',
-    #         args.test_dataset_fraction
-    #     )
+    # TVM MODEL WITH NCHW LAYOUT
+    for opt_level in [1, 2, 3, 4]:
+        print(f"TVM MODEL WITH NCHW LAYOUT OPT LEVEL {opt_level}")
+        tester = TVMModel(
+            dataset,
+            args.results_path
+            / f"{args.fp32_model_path.stem}.tvm-fp32-opt{opt_level}.so",  # noqa: E501
+            args.fp32_model_path,
+            args.results_path / f"tvm-fp32-opt{opt_level}",
+            args.target,
+            args.target_host,
+            opt_level,
+            use_nchw_layout=True,
+        )
+        tester.test_inference(
+            args.results_path, f"tvm-fp32-opt{opt_level}", args.test_dataset_fraction
+        )
 
-    # # TVM PRE-QUANTIZED MODEL WITH NCHW LAYOUT
-    # print('TVM PRE-QUANTIZED MODEL WITH NCHW LAYOUT')
-    # tester = TVMModel(
-    #     dataset,
-    #     args.results_path / f'{args.int8_model_path.stem}.tvm-int8.so',
-    #     args.int8_model_path,
-    #     args.results_path / 'tvm-int8',
-    #     args.target,
-    #     args.target_host,
-    #     3,
-    #     use_nchw_layout=True
-    # )
-    # tester.test_inference(
-    #     args.results_path,
-    #     'tvm-int8',
-    #     args.test_dataset_fraction
-    # )
+    # TVM PRE-QUANTIZED MODEL WITH NCHW LAYOUT
+    print("TVM PRE-QUANTIZED MODEL WITH NCHW LAYOUT")
+    tester = TVMModel(
+        dataset,
+        args.results_path / f"{args.int8_model_path.stem}.tvm-int8.so",
+        args.int8_model_path,
+        args.results_path / "tvm-int8",
+        args.target,
+        args.target_host,
+        3,
+        use_nchw_layout=True,
+    )
+    tester.test_inference(args.results_path, "tvm-int8", args.test_dataset_fraction)
